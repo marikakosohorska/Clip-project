@@ -34,6 +34,32 @@ dict_pretrain = {
     'clipB16laion2B'    : ('ViT-B-16', 'laion2b_s34b_b88k'),
 }
 
+import torch
+import torch.nn.functional as F
+
+class DifferentiableClipTransform(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.resize_size = 224  # Resize target size
+        self.crop_size = 224    # Center crop size
+        self.mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+
+    def forward(self, x):
+        # Resize using bilinear interpolation
+        x = F.interpolate(x, size=self.resize_size, mode='bicubic', align_corners=False)
+        
+        # Center crop
+        h, w = x.shape[2], x.shape[3]
+        top = (h - self.crop_size) // 2
+        left = (w - self.crop_size) // 2
+        x = x[:, :, top:top + self.crop_size, left:left + self.crop_size]
+        
+        # Normalize
+        x = (x - self.mean.to(x.device)) / self.std.to(x.device)
+        return x
+
+
 class OpenClipLinear(nn.Module):
     def __init__(self, num_classes=1, pretrain='clipL14commonpool', normalize=True, next_to_last=False):
         super(OpenClipLinear, self).__init__()
@@ -49,7 +75,8 @@ class OpenClipLinear(nn.Module):
             backbone.visual.proj = None
         else:
             self.num_features = backbone.visual.output_dim
-        
+
+        self.transform = DifferentiableClipTransform()
         self.bb = [backbone, ]
         self.normalize = normalize
         
@@ -71,4 +98,5 @@ class OpenClipLinear(nn.Module):
         return self.fc(x)
 
     def forward(self, x):
+        x = self.transform(x)
         return self.forward_head(self.forward_features(x))
