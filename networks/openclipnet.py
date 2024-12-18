@@ -76,7 +76,7 @@ class OpenClipLinear(nn.Module):
         else:
             self.num_features = backbone.visual.output_dim
 
-        self.transform = DifferentiableClipTransform()
+        # self.transform = DifferentiableClipTransform()
         self.bb = [backbone, ]
         self.normalize = normalize
         
@@ -98,5 +98,5 @@ class OpenClipLinear(nn.Module):
         return self.fc(x)
 
     def forward(self, x):
-        x = self.transform(x)
+        # x = self.transform(x)
         return self.forward_head(self.forward_features(x))

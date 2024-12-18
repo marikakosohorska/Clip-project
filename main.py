@@ -37,7 +37,7 @@ from torchvision.transforms import Compose, Resize, CenterCrop, Normalize, ToTen
 from torchvision.transforms.functional import InterpolationMode
 import random
 
-# from memory_profiler import profile
+from networks.resnet_mod import ResNet
 
 # podiva se napr do souboru weights/clipdet_latent10k/config.yaml
 def get_config(model_name, weights_dir='./weights'):
@@ -58,6 +58,8 @@ def runnig_tests(input_csv, weights_dir, models_list, device, batch_size = 1):
     print("Models:")
     for model_name in models_list:
         print(model_name, flush=True)
+        print(model_name)
+        print(weights_dir)
         _, model_path, arch, norm_type, patch_size = get_config(model_name, weights_dir=weights_dir)
         model = load_weights(create_architecture(arch), model_path)
         model = model.to(device).eval()
@@ -85,7 +87,6 @@ def runnig_tests(input_csv, weights_dir, models_list, device, batch_size = 1):
         transform = Compose(transform)
         transform_dict[transform_key] = transform
         models_dict[model_name] = (transform_key, model)
-        print(flush=True)
 
     ### test
     with torch.no_grad():
@@ -137,7 +138,7 @@ def runnig_tests(input_csv, weights_dir, models_list, device, batch_size = 1):
                 batch_img = {k: list() for k in transform_dict}
                 batch_id = list()
 
-            assert len(batch_id)==0
+            assert len(batch_id) == 0
 
     return table
 
@@ -158,8 +159,8 @@ def train_linear(input_csv, device):
         param.requires_grad = False
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.fc.parameters(), lr=0.001)
-    num_epochs = 2
-    batch_size = 1
+    num_epochs = 3
+    batch_size = 16
 
     model.train()
     for epoch in range(num_epochs):
@@ -203,7 +204,7 @@ def train_linear(input_csv, device):
     torch.save(model.state_dict(), 'weights_linear.pth')
     print("weights saved")
 
-def train_adversarial(input_csv, device, step_w, step_data, lambda_reg, epsilon):
+def train_adversarial(input_csv, device, step_w, step_data, gamma, epsilon):
     files = pandas.read_csv(input_csv)[['filename']]
     typs = pandas.read_csv(input_csv)[['typ']]
     rootdataset = os.path.dirname(os.path.abspath(input_csv))
@@ -214,9 +215,8 @@ def train_adversarial(input_csv, device, step_w, step_data, lambda_reg, epsilon)
         param.requires_grad = False
 
     criterion = nn.BCEWithLogitsLoss()
-    # optimizer = torch.optim.Adam(model.fc.parameters(), lr=0.001)
-    num_epochs = 10
-    batch_size = 1
+    num_epochs = 5
+    batch_size = 16
 
     model.train()
 
@@ -230,8 +230,8 @@ def train_adversarial(input_csv, device, step_w, step_data, lambda_reg, epsilon)
         filenames = list(files['filename'])
         # random.shuffle(filenames)
 
-        for batch_start in tqdm.tqdm(range(1000, 1010, batch_size)):
-        # for batch_start in tqdm.tqdm(range(1500, 1510, batch_size)):
+        for batch_start in tqdm.tqdm(range(1000,2000, batch_size)):
+            # 1. DRAW A BATCH
             batch_filenames = filenames[batch_start:batch_start + batch_size]
             batch_images = []
             cont = True
@@ -239,7 +239,7 @@ def train_adversarial(input_csv, device, step_w, step_data, lambda_reg, epsilon)
                 img_path = os.path.join(rootdataset, filename)
                 try:
                     image = Image.open(img_path).convert('RGB')
-                    batch_images.append(ToTensor()(image))
+                    batch_images.append(clip_transform()(image))
                     cont = False
                 except FileNotFoundError:
                     print(f"File not found: {filename}. Skipping.")
@@ -251,43 +251,44 @@ def train_adversarial(input_csv, device, step_w, step_data, lambda_reg, epsilon)
             batch_labels = torch.tensor([0 if typs.loc[files['filename'] == filename, 'typ'].values[0] == 'real' else 1 for filename in batch_filenames],
                                         dtype=torch.float32).unsqueeze(1).to(device)
 
-            print("ORIGINAL IMAGE")
+            print("orinal image")
             print(batch_images[0].shape)
             print(batch_images[0])
 
+            # 2. COMPUTE GRADIENTS APPROXIMATIONS
             batch_perturbations = []
             for filename in batch_filenames:
                 if filename not in perturbations_dict:
                     perturbations_dict[filename] = np.zeros_like(batch_images[0].cpu().detach().numpy())
                 batch_perturbations.append(torch.tensor(perturbations_dict[filename]).to(device))
             batch_perturbations = torch.stack(batch_perturbations).to(device)
-            batch_images_with_perturbations = torch.clamp(batch_images + batch_perturbations, 0, 1)
+            batch_images_with_perturbations = batch_images + batch_perturbations
             batch_images_with_perturbations.requires_grad = True
 
-            print("PERTURBATIONS")
+            print("perturbations")
             print(batch_perturbations.shape)
             print(batch_perturbations)
 
-            print("NEW IMAGE")
+            print("new image")
             print(batch_images_with_perturbations.shape)
             print(batch_images_with_perturbations)
 
-            # 1. UPDATE WEIGHTS
             logits = model(batch_images_with_perturbations)
             loss = criterion(logits, batch_labels)
             norm_loss = torch.norm(batch_images - batch_images_with_perturbations, p=2)**2
-            total_loss = loss - lambda_reg * norm_loss
+            total_loss = loss - gamma * norm_loss
             total_loss.backward()
 
-            print("GRADIENT")
+            print("gradient")
             print(batch_images_with_perturbations.grad.shape)
             print(batch_images_with_perturbations.grad)
 
+            # 3. UPDATE WEIGHTS
             with torch.no_grad():
                 for param in model.fc.parameters(): # weights (768) + bias (1)
                     param -= step_w * param.grad # zprumerovany pres batch_size .mean()?
 
-            # 2. UPDATE PERTURBATIONS
+            # 4. UPDATE PERTURBATIONS
             with torch.no_grad():
                 perturbation = step_data * batch_images_with_perturbations.grad
                 for idx, filename in enumerate(batch_filenames):
@@ -303,22 +304,6 @@ def train_adversarial(input_csv, device, step_w, step_data, lambda_reg, epsilon)
 
         print(f"Epoch {epoch + 1} Loss: {running_loss / len(filenames)-skipped}")
 
-        if (epoch == 9):
-            for idx, (filename, perturbation) in enumerate(perturbations_dict.items()):
-                img_path = os.path.join(rootdataset, filename)
-                image = Image.open(img_path).convert('RGB')
-                image = ToTensor()(image).unsqueeze(0).to(device)
-
-                perturbation_tensor = torch.tensor(perturbation).to(device)
-                adversarial_image = torch.clamp(image + perturbation_tensor, 0, 1)
-                # adversarial_image = image + perturbation_tensor
-
-                image_np = adversarial_image.squeeze(0).cpu().detach().numpy().transpose(1, 2, 0)
-                image_pil = Image.fromarray((image_np * 255).astype(np.uint8))
-
-                image_filename = os.path.join('images_adversarial', f'adversarial_image_{idx}.jpg')
-                image_pil.save(image_filename)
-
     torch.save(model.state_dict(), 'weights_linear_adversarial.pth')
     np.save('perturbations.npy', perturbations_dict)
 
@@ -329,15 +314,36 @@ def train_adversarial(input_csv, device, step_w, step_data, lambda_reg, epsilon)
 
     print("Training complete.")
 
-def test_linear(input_csv, device):
+
+def test_linear(input_csv, device, input_type, model_type, data_from, data_to):
     files = pandas.read_csv(input_csv)[['filename',]]
     typs = pandas.read_csv(input_csv)[['typ',]]
     rootdataset = os.path.dirname(os.path.abspath(input_csv))
+    if input_type == 'italy_pgd':
+        perturbations_path = os.path.join(os.path.abspath('pgd_italy_perturbations.npy'))
+        perturbations_dict = np.load(perturbations_path, allow_pickle=True).item()
+    elif input_type == 'italy_train':
+        pass
+    elif input_type == 'marika_pgd':
+        perturbations_path = os.path.join(os.path.abspath('marika_pgd_perturbations.npy'))
+        perturbations_dict = np.load(perturbations_path, allow_pickle=True).item()
+    elif input_type == 'marika_train':
+        perturbations_path = os.path.join(os.path.abspath('perturbations.npy'))
+        perturbations_dict = np.load(perturbations_path, allow_pickle=True).item()
+        
+
     model = OpenClipLinear().to(device)
-    
-    model.load_state_dict(torch.load('weights_linear_adversarial.pth'))
-    
-    model.eval()
+
+    if model_type == 'italy':
+        _, model_path, arch, norm_type, patch_size = get_config('clipdet_latent10k_plus', weights_dir='./weights')
+        model = load_weights(create_architecture(arch), model_path)
+    elif model_type == 'resnet':
+        _, model_path, arch, norm_type, patch_size = get_config('Corvi2023', weights_dir='./weights')
+        model = load_weights(create_architecture(arch), model_path)
+    elif model_type == 'marika':
+        model.load_state_dict(torch.load('weights_linear_adversarial.pth'))
+
+    model = model.to(device).eval()
     
     criterion = nn.BCEWithLogitsLoss()
     running_loss = 0.0
@@ -346,7 +352,7 @@ def test_linear(input_csv, device):
     skipped = 0
 
     with torch.no_grad():
-        for index in tqdm.tqdm(files.index, total=len(files)):
+        for index in tqdm.tqdm(range(data_from,data_to)):
             filename = os.path.join(rootdataset, files.loc[index, 'filename'])
             label_path = os.path.join(rootdataset, typs.loc[index, 'typ'])
             label_str = os.path.basename(label_path)
@@ -358,13 +364,17 @@ def test_linear(input_csv, device):
                 skipped += 1
                 continue
 
-            # Forward pass
-            logit = model(image.unsqueeze(0))  # Unsqueeze to make it a batch of size 1
+            if input_type == 'italy_pgd' or input_type == 'marika_pgd' or input_type == 'italy_train' or input_type == 'marika_train':
+                perturbation = torch.tensor(perturbations_dict[files.loc[index, 'filename']]).to(device)
+                adversarial_image = image + perturbation
+                logit = model(adversarial_image.unsqueeze(0))
+            else:
+                logit = model(image.unsqueeze(0))
+
             loss = criterion(logit, torch.tensor([[label_num]], dtype=torch.float32).to(device))
             running_loss += loss.item()
 
-            # Calculate predictions
-            predicted_label = 1 if torch.sigmoid(logit) > 0.5 else 0  # Apply sigmoid and threshold to get binary prediction
+            predicted_label = 1 if torch.sigmoid(logit) > 0.5 else 0
             print("predicted label")
             print(predicted_label)
             print("correct label")
@@ -374,9 +384,134 @@ def test_linear(input_csv, device):
             print(correct_predictions)
             total_predictions += 1
 
-    # Print loss and accuracy after testing
-    print(f"Test Loss: {running_loss / (len(files) - skipped)}")
-    print(f"Accuracy: {correct_predictions / total_predictions * 100:.2f}%")
+    accuracy = correct_predictions / total_predictions * 100
+    loss = running_loss / (len(files) - skipped)
+    print(f"Accuracy: {accuracy:.2f}%")
+    print(f"Test Loss: {loss}")
+    return accuracy, loss
+
+
+def pgd_attack_generate(input_csv, device, model_type, epsilon=0.03, alpha=0.005, num_iter=40):
+    files = pandas.read_csv(input_csv)[['filename',]]
+    typs = pandas.read_csv(input_csv)[['typ',]]
+    rootdataset = os.path.dirname(os.path.abspath(input_csv))
+
+    if model_type == 'italy':
+        _, model_path, arch, norm_type, patch_size = get_config('clipdet_latent10k_plus', weights_dir='./weights')
+        model = load_weights(create_architecture(arch), model_path)
+    elif model_type == 'resnet':
+        _, model_path, arch, norm_type, patch_size = get_config('Corvi2023', weights_dir='./weights')
+        model = load_weights(create_architecture(arch), model_path)
+    elif model_type == 'marika':
+        model = OpenClipLinear().to(device)
+        model.load_state_dict(torch.load('weights_linear_adversarial.pth'))
+
+    model = model.to(device).eval()
+    perturbations_dict = {}
+
+    for index in tqdm.tqdm(range(len(files))):
+        filename = os.path.join(rootdataset, files.loc[index, 'filename'])
+        label_path = os.path.join(rootdataset, typs.loc[index, 'typ'])
+        label_str = os.path.basename(label_path)
+        label_num = 0 if label_str == 'real' else 1
+
+        try:
+            image = clip_transform()(Image.open(filename).convert('RGB')).to(device)
+        except FileNotFoundError:
+            print(f"File not found: {filename}. Skipping this file.")
+            continue
+
+        perturbation, flipped = pgd_attack(
+            model=model,
+            image=image.unsqueeze(0),
+            label=torch.tensor([[label_num]], dtype=torch.float32).to(device),
+            device=device,
+            epsilon=epsilon,
+            alpha=alpha,
+            num_iter=num_iter
+        )
+        perturbations_dict[files.loc[index, 'filename']] = perturbation.squeeze(0).cpu().numpy()
+        
+        if flipped:
+            print(f"Adversarial perturbation successfully generated and saved for {filename}")
+        else:
+            print(f"Perturbation generated for {filename}, but no label flip occurred.")
+
+    if model_type == 'italy':
+        np.save('italy_pgd_perturbations.npy', perturbations_dict)
+    else:
+        np.save('marika_pgd_perturbations.npy', perturbations_dict)
+
+
+def pgd_attack(model, image, label, device, epsilon=0.03, alpha=0.005, num_iter=40):
+    perturbed_image = image.clone().detach().to(device)
+    perturbed_image.requires_grad = True
+    original_prediction = (torch.sigmoid(model(image)) > 0.5).item()
+
+    for i in range(num_iter):
+        output = model(perturbed_image)
+        loss = torch.nn.BCEWithLogitsLoss()(output, label)
+
+        loss.backward()
+
+        perturbed_image = perturbed_image + alpha * perturbed_image.grad.sign()
+
+        perturbed_image = torch.clamp(perturbed_image, min=image - epsilon, max=image + epsilon).detach()
+        # perturbed_image = torch.clamp(perturbed_image, min=0, max=1).detach()
+        perturbed_image.requires_grad = True
+
+        new_prediction = (torch.sigmoid(model(perturbed_image)) > 0.5).item()
+        if new_prediction != original_prediction:
+            print(f"Label flipped at iteration {i+1}.")
+            perturbation = (perturbed_image - image).detach()
+            return perturbation, True
+
+    print("No label flip occurred.")
+    perturbation = (perturbed_image - image).detach()
+    return perturbation, False
+
+def run_experiments(in_csv, out_csv, device):
+    import csv
+    # datasety - ted fixni
+    # num_epochs - ted fixni
+    # batch_size - ted fixni
+    # step size wahy, step size data, gamma, epsilon
+    headers = ['epsilon', 'step_size_w', 'step_size_data', 
+            'genuine_loss', 'genuine_acc',
+            'italy_pgd_loss', 'italy_pgd_acc',
+            'marika_pgd_loss', 'marika_pgd_acc',
+            'marika_train_loss', 'marika_train_acc']
+    with open(out_csv, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(headers)
+        step_size_w = 0.001
+        while step_size_w < 1:
+            step_size_data = 0.01
+            while step_size_data < 10:
+                epsilon = 0.1
+                while epsilon < 0.6:
+                    train_adversarial(in_csv, device, step_size_w, step_size_data, 0.1, epsilon)
+                    pgd_attack_generate(in_csv, device, 'marika')
+                    acc1, loss1 = test_linear(in_csv, device, 'genuine', 'marika', 0, 2000)
+                    acc2, loss2 = test_linear(in_csv, device, 'italy_pgd', 'marika', 0, 2000)
+                    acc3, loss3 = test_linear(in_csv, device, 'marika_pgd', 'marika', 0, 2000)
+                    acc4, loss4 = test_linear(in_csv, device, 'marika_train', 'marika', 1000, 2000)
+                    writer.writerow([
+                        epsilon, step_size_w, step_size_data,
+                        loss1, acc1,
+                        loss2, acc2,
+                        loss3, acc3,
+                        loss4, acc4
+                    ])
+                    epsilon += 0.2
+                step_size_data *= 10
+            step_size_w *= 10
+    print(f"Results have been saved to {out_csv}")
+
+
+
+
+    
 
 
 if __name__ == "__main__":
@@ -397,10 +532,14 @@ if __name__ == "__main__":
         args['models'] = args['models'].split(',')
 
     # train_linear(args['in_csv'], args['device'])
-    train_adversarial(args['in_csv'], args['device'], 0.01, 10, 1000, 100) # the last two parameters: step_size_vahy, step_size_data
-    test_linear(args['in_csv'], args['device'])
+    train_adversarial(args['in_csv'], args['device'], 0.001, 0.01, 0.1, 0.1) # step_size_vahy, step_size_data, gamma, epsilon
+    # test_italy(args['in_csv'], args['device'])
 
-    # checkpoint = torch.load('weights_linear_final.pth')
+    pgd_attack_generate(args['in_csv'], args['device'], 'marika')
+    test_linear(args['in_csv'], args['device'], 'marika_pgd', 'marika', 0, 2000)
+    # run_experiments(args['in_csv'], 'experiments.csv', args['device'])
+
+    # checkpoint = torch.load('perturbations.npy')
 
     # Print the contents of the checkpoint to see what's inside
     # print("Contents of the .pth file:")
